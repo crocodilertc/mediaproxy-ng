@@ -28,12 +28,17 @@
 
 struct poller;
 struct control_stream;
-struct peer;
-struct callstream;
 struct call;
 struct callmaster;
 struct redis;
 struct crypto_suite;
+struct mediaproxy_srtp;
+struct streamhandler;
+
+
+typedef bencode_buffer_t call_buffer_t;
+#define call_buffer_alloc bencode_buffer_alloc
+#define call_buffer_init bencode_buffer_init
 
 
 
@@ -72,6 +77,7 @@ struct stats {
 	u_int64_t			errors;
 };
 
+/*
 struct stream {
 	struct in6_addr		ip46;
 	u_int16_t		port;
@@ -87,15 +93,29 @@ struct stream_input {
 	int			is_rtcp:1;
 	int			rtcp_mux:1;
 };
+*/
 struct udp_fd {
 	int			fd;
 	u_int16_t		localport;
 };
+struct endpoint {
+	struct in6_addr		ip46;
+	u_int16_t		port;
+};
+struct stream_params {
+	unsigned int		index; /* starting with 1 */
+	struct endpoint		rtp_endpoint;
+	struct endpoint		rtcp_endpoint;
+	unsigned int		consecutive_ports;
+	enum transport_protocol	protocol;
+	struct crypto_context	crypto;
 
-struct streamrelay;
-struct mediaproxy_srtp;
-struct streamhandler;
+	int			no_rtcp:1;
+	int			implicit_rtcp:1;
+	int			rtcp_mux:1;
+};
 
+/*
 struct streamrelay {
 	struct udp_fd		fd;
 	struct stream		peer;
@@ -140,23 +160,85 @@ struct callstream {
 	struct call		*call;
 	int			num;
 };
+*/
+
+struct packet_stream {
+	struct obj		obj;
+
+	struct call_media	*media;
+	struct call		*call;
+
+	struct udp_fd		fd;
+	struct packet_stream	*rtp_sink;
+	struct packet_stream	*rtcp_sink;
+	struct endpoint		endpoint;
+	struct endpoint		advertised_endpoint;
+	struct crypto_context_pair crypto;
+
+	struct stats		stats;
+	struct stats		kernel_stats;
+	time_t			last_packet;
+
+	int			rtcp:1;
+	int			implicit_rtcp:1;
+	int			stun:1;
+	int			filled:1;
+};
+
+struct call_media {
+	struct obj		obj;
+
+	struct call_monologue	*monologue;
+	struct call		*call;
+
+	unsigned int		index;
+	str			type;
+	enum transport_protocol	protocol;
+
+	str			ice_ufrag;
+	str			ice_pwd;
+
+	GQueue			streams; /* normally RTP + RTCP */
+
+	int			asynchronous:1;
+	int			send:1;
+	int			receive:1;
+	int			rtcp_mux:1;
+};
+
+/* half a dialogue */
+struct call_monologue {
+	struct obj		obj;
+
+	struct call		*call;
+
+	str			tag;
+	time_t			created;
+	GQueue			dialogues;
+	GHashTable		*other_tags;
+	struct call_monologue	*active_dialogue;
+
+	GQueue			medias;
+};
 
 struct call {
 	struct obj		obj;
 
 	struct callmaster	*callmaster;
 
-	mutex_t			chunk_lock;
-	GStringChunk		*chunk;
+	mutex_t			buffer_lock;
+	call_buffer_t		buffer;
 
-	mutex_t			lock;
-	GQueue			*callstreams;
-	GHashTable		*branches;
+	mutex_t			master_lock;
+	GList			*monologues;
+	GHashTable		*tags;
+	//GHashTable		*branches;
+	GList			*streams;
 
 	str			callid;
 	char			redis_uuid[37];
 	time_t			created;
-	time_t			lookup_done;
+	time_t			last_signal;
 };
 
 struct callmaster_config {
@@ -205,7 +287,7 @@ void calls_dump_redis(struct callmaster *);
 
 struct call *call_get_or_create(const str *callid, const str *viabranch, struct callmaster *m);
 struct callstream *callstream_new(struct call *ca, int num);
-void callstream_init(struct callstream *s, struct relays_cache *);
+//void callstream_init(struct callstream *s, struct relays_cache *);
 void kernelize(struct callstream *c);
 int call_stream_address(char *o, struct peer *p, enum stream_address_format format, int *len);
 int call_stream_address_alt(char *o, struct peer *p, enum stream_address_format format, int *len);
@@ -219,23 +301,33 @@ enum transport_protocol transport_protocol(const str *s);
 
 
 
-static inline char *call_strdup(struct call *c, const char *s) {
+static inline void *call_malloc(struct call *c, size_t l) {
+	void *ret;
+	mutex_lock(&c->buffer_lock);
+	ret = call_buffer_alloc(&c->buffer, l);
+	mutex_unlock(&c->buffer_lock);
+	return ret;
+}
+
+static inline char *call_strdup_len(struct call *c, const char *s, unsigned int len) {
 	char *r;
+	r = call_malloc(c, len + 1);
+	memcpy(r, s, len);
+	r[len] = 0;
+	return r;
+}
+
+static inline char *call_strdup(struct call *c, const char *s) {
 	if (!s)
 		return NULL;
-	mutex_lock(&c->chunk_lock);
-	r = g_string_chunk_insert(c->chunk, s);
-	mutex_unlock(&c->chunk_lock);
-	return r;
+	return call_strdup_len(c, s, strlen(s));
 }
 static inline str *call_str_cpy_len(struct call *c, str *out, const char *in, int len) {
 	if (!in) {
 		*out = STR_NULL;
 		return out;
 	}
-	mutex_lock(&c->chunk_lock);
-	out->s = g_string_chunk_insert_len(c->chunk, in, len);
-	mutex_unlock(&c->chunk_lock);
+	out->s = call_strdup_len(c, in, len);
 	out->len = len;
 	return out;
 }
@@ -247,9 +339,8 @@ static inline str *call_str_cpy_c(struct call *c, str *out, const char *in) {
 }
 static inline str *call_str_dup(struct call *c, const str *in) {
 	str *out;
-	mutex_lock(&c->chunk_lock);
-	out = str_chunk_insert(c->chunk, in);
-	mutex_unlock(&c->chunk_lock);
+	out = call_malloc(c, sizeof(*out));
+	call_str_cpy_len(c, out, in->s, in->len);
 	return out;
 }
 static inline str *call_str_init_dup(struct call *c, char *s) {

@@ -783,6 +783,45 @@ static int fill_stream_address(struct stream_input *si, struct sdp_media *media,
 	return 0;
 }
 
+static int fill_endpoint(struct endpoint *ep, const struct sdp_media *media, struct sdp_ng_flags *flags,
+		struct network_address *address, long int port) {
+	struct sdp_session *session = media->session;
+
+	if (flags->media_address.s) {
+		if (is_addr_unspecified(&flags->parsed_media_address)) {
+			if (__parse_address(&flags->parsed_media_address, NULL, NULL,
+						&flags->media_address))
+				return -1;
+		}
+		ep->ip46 = flags->parsed_media_address;
+	}
+	else if (!flags->trust_address) {
+		if (is_addr_unspecified(&flags->parsed_received_from)) {
+			if (__parse_address(&flags->parsed_received_from, NULL, &flags->received_from_family,
+						&flags->received_from_address))
+				return -1;
+		}
+		ep->ip46 = flags->parsed_received_from;
+	}
+	else if (address) {
+		if (is_addr_unspecified(&address->parsed)) {
+			if (parse_address(address))
+				return -1;
+		}
+		ep->ip46 = address->parsed;
+	}
+	else if (media->connection.parsed)
+		ep->ip46 = media->connection.address.parsed;
+	else if (session->connection.parsed)
+		ep->ip46 = session->connection.address.parsed;
+	else
+		return -1;
+
+	ep->port = port;
+
+	return 0;
+}
+
 static int fill_stream(struct stream_input *si, struct sdp_media *media, int offset, struct sdp_ng_flags *flags) {
 	if (fill_stream_address(si, media, flags))
 		return -1;
@@ -800,16 +839,14 @@ static int fill_stream_rtcp(struct stream_input *si, struct sdp_media *media, in
 	return 0;
 }
 
-int sdp_streams(const GQueue *sessions, GQueue *streams, GHashTable *streamhash, struct sdp_ng_flags *flags) {
+int sdp_streams(const GQueue *sessions, GQueue *streams, struct sdp_ng_flags *flags) {
 	struct sdp_session *session;
 	struct sdp_media *media;
-	struct stream_input *si;
+	struct stream_params *sp;
 	GList *l, *k;
 	const char *errstr;
-	int i, num;
+	int num;
 	struct sdp_attribute *attr;
-	enum transport_protocol tp;
-	struct crypto_context cctx;
 
 	num = 0;
 	for (l = sessions->head; l; l = l->next) {
@@ -817,78 +854,56 @@ int sdp_streams(const GQueue *sessions, GQueue *streams, GHashTable *streamhash,
 
 		for (k = session->media_streams.head; k; k = k->next) {
 			media = k->data;
-			tp = transport_protocol(&media->transport);
 
-			ZERO(cctx);
+			sp = g_slice_alloc0(sizeof(*sp));
+			sp->index = ++num;
+
+			errstr = "No address info found for stream";
+			if (fill_endpoint(&sp->rtp_endpoint, media, flags, NULL, media->port_num))
+				goto error;
+
+			sp->consecutive_ports = media->port_count;
+			sp->protocol = transport_protocol(&media->transport);
+
 			attr = attr_get_by_id(&media->attributes, ATTR_CRYPTO);
 			if (attr) {
-				cctx.crypto_suite = attr->u.crypto.crypto_suite;
-				cctx.mki = attr->u.crypto.mki;
-				cctx.mki_len = attr->u.crypto.mki_len;
-				cctx.tag = attr->u.crypto.tag;
-				assert(sizeof(cctx.master_key) >= attr->u.crypto.master_key.len);
-				assert(sizeof(cctx.master_salt) >= attr->u.crypto.salt.len);
-				memcpy(cctx.master_key, attr->u.crypto.master_key.s, attr->u.crypto.master_key.len);
-				memcpy(cctx.master_salt, attr->u.crypto.salt.s, attr->u.crypto.salt.len);
-				assert(sizeof(cctx.session_key) >= cctx.crypto_suite->session_key_len);
-				assert(sizeof(cctx.session_salt) >= cctx.crypto_suite->session_salt_len);
+				sp->crypto.crypto_suite = attr->u.crypto.crypto_suite;
+				sp->crypto.mki = attr->u.crypto.mki;
+				sp->crypto.mki_len = attr->u.crypto.mki_len;
+				sp->crypto.tag = attr->u.crypto.tag;
+				assert(sizeof(sp->crypto.master_key) >= attr->u.crypto.master_key.len);
+				assert(sizeof(sp->crypto.master_salt) >= attr->u.crypto.salt.len);
+				memcpy(sp->crypto.master_key, attr->u.crypto.master_key.s, attr->u.crypto.master_key.len);
+				memcpy(sp->crypto.master_salt, attr->u.crypto.salt.s, attr->u.crypto.salt.len);
+				assert(sizeof(sp->crypto.session_key) >= sp->crypto.crypto_suite->session_key_len);
+				assert(sizeof(sp->crypto.session_salt) >= sp->crypto.crypto_suite->session_salt_len);
 			}
 
-			si = NULL;
-			for (i = 0; i < media->port_count; i++) {
-				si = g_slice_alloc0(sizeof(*si));
-
-				errstr = "No address info found for stream";
-				if (fill_stream(si, media, i, flags))
-					goto error;
-
-				if (i == 0 && g_hash_table_contains(streamhash, si)) {
-					g_slice_free1(sizeof(*si), si);
-					continue;
-				}
-
-				si->stream.num = ++num;
-				si->consecutive_num = (i == 0) ? media->port_count : 1;
-				si->stream.protocol = tp;
-				si->crypto = cctx;
-				memcpy(&si->direction, &flags->directions, sizeof(si->direction));
-
-				g_hash_table_insert(streamhash, si, si);
-				g_queue_push_tail(streams, si);
-			}
-
-			if (!si || media->port_count != 1)
-				continue;
+			/* determine RTCP endpoint */
 
 			if (attr_get_by_id(&media->attributes, ATTR_RTCP_MUX)) {
-				si->rtcp_mux = 1;
+				sp->rtcp_mux = 1;
 				continue;
 			}
+
+			if (media->port_count != 1)
+				continue;
 
 			attr = attr_get_by_id(&media->attributes, ATTR_RTCP);
-			if (!attr || !attr->u.rtcp.port_num)
-				continue;
-			if (attr->u.rtcp.port_num == si->stream.port) {
-				si->rtcp_mux = 1;
+			if (!attr) {
+				sp->implicit_rtcp = 1;
 				continue;
 			}
-			if (attr->u.rtcp.port_num == si->stream.port + 1)
+			if (attr->u.rtcp.port_num == sp->rtp_endpoint.port) {
+				sp->rtcp_mux = 1;
 				continue;
-
-			si->has_rtcp = 1;
-
-			si = g_slice_alloc0(sizeof(*si));
-			if (fill_stream_rtcp(si, media, attr->u.rtcp.port_num, flags))
+			}
+			errstr = "Invalid RTCP attribute";
+			if (fill_endpoint(&sp->rtcp_endpoint, media, flags, &attr->u.rtcp.address,
+						attr->u.rtcp.port_num))
 				goto error;
-			si->stream.num = ++num;
-			si->consecutive_num = 1;
-			si->is_rtcp = 1;
-			si->stream.protocol = tp;
-			si->crypto = cctx;
-			memcpy(&si->direction, &flags->directions, sizeof(si->direction));
 
-			g_hash_table_insert(streamhash, si, si);
-			g_queue_push_tail(streams, si);
+			g_queue_push_tail(streams, sp);
 		}
 	}
 
@@ -896,8 +911,8 @@ int sdp_streams(const GQueue *sessions, GQueue *streams, GHashTable *streamhash,
 
 error:
 	mylog(LOG_WARNING, "Failed to extract streams from SDP: %s", errstr);
-	if (si)
-		g_slice_free1(sizeof(*si), si);
+	if (sp)
+		g_slice_free1(sizeof(*sp), sp);
 	return -1;
 }
 

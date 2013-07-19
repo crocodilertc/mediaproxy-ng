@@ -816,7 +816,7 @@ static void streams_parse(const char *s, struct callmaster *m, GQueue *q) {
 }
 
 static void streams_free(GQueue *q) {
-	struct stream_input *s;
+	struct stream_params *s;
 
 	while ((s = g_queue_pop_head(q)))
 		g_slice_free1(sizeof(*s), s);
@@ -1537,7 +1537,7 @@ void relays_cache_cleanup(struct relays_cache *c, struct callmaster *m) {
 static int call_streams(struct call *c, GQueue *s, const str *tag, enum call_opmode opmode) {
 	GQueue *q;
 	GList *i, *l;
-	struct stream_input *t;
+	struct stream_params *sp;
 	int x;
 	struct streamrelay *matched_relay;
 	struct callstream *cs, *cs_o;
@@ -1549,7 +1549,7 @@ static int call_streams(struct call *c, GQueue *s, const str *tag, enum call_opm
 	relays_cache_init(&relays_cache);
 
 	for (i = s->head; i; i = i->next) {
-		t = i->data;
+		sp = i->data;
 
 		p = NULL;
 
@@ -2001,13 +2001,12 @@ static struct call *call_create(const str *callid, struct callmaster *m) {
 		STR_FMT(callid));	/* XXX will spam syslog on recovery from DB */
 	c = obj_alloc0("call", sizeof(*c), call_free);
 	c->callmaster = m;
-	c->chunk = g_string_chunk_new(256);
-	mutex_init(&c->chunk_lock);
+	mutex_init(&c->buffer_init);
+	call_buffer_init(&c->buffer);
+	mutex_init(&c->master_lock);
+	c->tags = g_hash_table_new(str_hash, str_equal);
 	call_str_cpy(c, &c->callid, callid);
-	c->callstreams = g_queue_new();
 	c->created = poller_now;
-	c->branches = g_hash_table_new(str_hash, str_equal);
-	mutex_init(&c->lock);
 	return c;
 }
 
@@ -2039,11 +2038,6 @@ restart:
 		rwlock_unlock_r(&m->hashlock);
 	}
 
-	if (viabranch && viabranch->s && viabranch->len
-			&& !g_hash_table_lookup(c->branches, viabranch))
-		g_hash_table_insert(c->branches, call_str_dup(c, viabranch),
-		(void *) 0x1);
-
 	return c;
 }
 
@@ -2061,11 +2055,6 @@ static struct call *call_get(const str *callid, const str *viabranch, struct cal
 	mutex_lock(&ret->lock);
 	obj_hold(ret);
 	rwlock_unlock_r(&m->hashlock);
-
-	if (viabranch && viabranch->s && viabranch->len) {
-		if (!g_hash_table_lookup(ret->branches, viabranch))
-			g_hash_table_insert(ret->branches, call_str_dup(ret, viabranch), (void *) 0x1);
-	}
 
 	return ret;
 }
@@ -2648,7 +2637,7 @@ static const char *call_offer_answer_ng(bencode_item_t *input, struct callmaster
 	int ret, num;
 	struct sdp_ng_flags flags;
 	struct sdp_chopper *chopper;
-	GHashTable *streamhash;
+	//GHashTable *streamhash;
 
 	if (!bencode_dictionary_get_str(input, "sdp", &sdp))
 		return "No SDP body in message";
@@ -2664,9 +2653,9 @@ static const char *call_offer_answer_ng(bencode_item_t *input, struct callmaster
 
 	call_ng_process_flags(&flags, input);
 
-	streamhash = g_hash_table_new((GHashFunc) stream_hash, (GEqualFunc) stream_equal);
+	//streamhash = g_hash_table_new((GHashFunc) stream_hash, (GEqualFunc) stream_equal);
 	errstr = "Incomplete SDP specification";
-	if (sdp_streams(&parsed, &streams, streamhash, &flags))
+	if (sdp_streams(call, &parsed, &streams, &flags))
 		goto out;
 
 	call = call_get_opmode(&callid, &viabranch, m, opmode);
